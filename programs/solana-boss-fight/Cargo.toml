@@ -1,0 +1,21 @@
+[package]
+name = "boss-fight-betting"
+version = "0.1.0"
+description = "Solana program for boss fight betting game"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "boss_fight_betting"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.1" }
+anchor-spl = { version = "0.31.1" }
