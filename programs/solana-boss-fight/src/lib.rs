@@ -131,8 +131,18 @@ pub mod boss_fight_betting {
         betting_round.authority = ctx.accounts.authority.key();
         betting_round.treasury = ctx.accounts.treasury.key();
         betting_round.betting_start_time = clock.unix_timestamp;
-        betting_round.betting_end_time = clock.unix_timestamp + betting_duration;
-        betting_round.fight_end_time = clock.unix_timestamp + betting_duration + fight_duration;
+        
+        // FIXED: Use checked_add for arithmetic operations
+        betting_round.betting_end_time = clock.unix_timestamp
+            .checked_add(betting_duration)
+            .ok_or(BettingError::ArithmeticOverflow)?;
+        
+        betting_round.fight_end_time = clock.unix_timestamp
+            .checked_add(betting_duration)
+            .ok_or(BettingError::ArithmeticOverflow)?
+            .checked_add(fight_duration)
+            .ok_or(BettingError::ArithmeticOverflow)?;
+        
         betting_round.initial_hp = initial_hp;
         betting_round.current_hp = initial_hp;
         betting_round.fee_percentage = fee_percentage;
@@ -366,11 +376,7 @@ pub mod boss_fight_betting {
         // Ensure escrow has enough lamports to send the payout
         require!(escrow_info.lamports() >= total_payout, BettingError::InsufficientEscrowFunds);
 
-        // ----------------------------------------------------
-        // ✅ CORRECTED TRANSFER LOGIC: System Program CPI with PDA Signer
-        // ----------------------------------------------------
-
-        // 1. Prepare the PDA seeds for signing
+        // Prepare the PDA seeds for signing
         let round_id_bytes = betting_round.round_id.to_le_bytes();
         let escrow_seeds: &[&[u8]] = &[
             b"escrow",
@@ -379,7 +385,7 @@ pub mod boss_fight_betting {
         ];
         let signer_seeds = &[&escrow_seeds[..]];
 
-        // 2. Execute the transfer, signed by the PDA
+        // Execute the transfer, signed by the PDA
         system_program::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.system_program.to_account_info(),
@@ -390,9 +396,7 @@ pub mod boss_fight_betting {
                 signer_seeds
             ),
             total_payout,
-        )?; 
-
-        // ----------------------------------------------------
+        )?;
 
         bet_account.payout_claimed = true;
 
@@ -436,12 +440,7 @@ pub mod boss_fight_betting {
         // Ensure escrow has enough lamports to send the fees
         require!(escrow_info.lamports() >= fee_amount, BettingError::InsufficientEscrowFunds);
 
-
-        // ----------------------------------------------------
-        // ✅ CORRECTED TRANSFER LOGIC: System Program CPI with PDA Signer
-        // ----------------------------------------------------
-
-        // 1. Prepare the PDA seeds for signing
+        // Prepare the PDA seeds for signing
         let round_id_bytes = betting_round.round_id.to_le_bytes();
         let escrow_seeds: &[&[u8]] = &[
             b"escrow",
@@ -450,7 +449,7 @@ pub mod boss_fight_betting {
         ];
         let signer_seeds = &[&escrow_seeds[..]];
 
-        // 2. Execute the transfer, signed by the PDA
+        // Execute the transfer, signed by the PDA
         system_program::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.system_program.to_account_info(),
@@ -461,9 +460,7 @@ pub mod boss_fight_betting {
                 signer_seeds
             ),
             fee_amount,
-        )?; 
-
-        // ----------------------------------------------------
+        )?;
 
         emit!(FeesClaimed {
             round_id: betting_round.round_id,
@@ -491,7 +488,6 @@ pub struct InitializeBettingRound<'info> {
     )]
     pub betting_round: Account<'info, BettingRound>,
 
-    /// Escrow PDA - just derive it, don't init
     #[account(
         mut,
         seeds = [b"escrow", round_id.to_le_bytes().as_ref()],
@@ -529,10 +525,11 @@ pub struct PlaceBet<'info> {
     #[account(
         mut,
         seeds = [b"escrow", betting_round.round_id.to_le_bytes().as_ref()],
-        bump
+        bump,
+        constraint = escrow.key() != bettor.key() @ BettingError::InvalidAccount
     )]
     /// CHECK: This is safe because it's the escrow account
-    pub escrow: UncheckedAccount<'info>, // FIXED: Used UncheckedAccount for PDA escrow
+    pub escrow: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub bettor: Signer<'info>,
@@ -584,10 +581,8 @@ pub struct ClaimPayout<'info> {
     pub escrow: UncheckedAccount<'info>,
 
     #[account(mut)]
-    // Bettor must be SystemAccount to receive SOL via CPI
     pub bettor: SystemAccount<'info>,
 
-    // ⭐️ CRITICAL FIX: Add Authority as a required signer ⭐️
     #[account(
         constraint = authority.key() == betting_round.authority @ BettingError::Unauthorized
     )]
@@ -609,11 +604,9 @@ pub struct ClaimFees<'info> {
     pub escrow: UncheckedAccount<'info>,
 
     #[account(mut)]
-    // Treasury must be mutable to receive SOL
     /// CHECK: Treasury account for fee collection
     pub treasury: UncheckedAccount<'info>,
 
-    // ⭐️ CRITICAL FIX: Add Authority as a signer ⭐️
     pub authority: Signer<'info>, 
 
     pub system_program: Program<'info, System>,
@@ -651,4 +644,8 @@ pub enum BettingError {
     Unauthorized,
     #[msg("Insufficient funds in escrow account for payout")]
     InsufficientEscrowFunds,
+    #[msg("Invalid account provided")]
+    InvalidAccount,
+    #[msg("Arithmetic overflow")]
+    ArithmeticOverflow,
 }
