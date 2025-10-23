@@ -282,7 +282,7 @@ pub mod boss_fight_betting {
     }
 
     /// End the fight and determine outcome
-    pub fn end_fight(ctx: Context<EndFight>) -> Result<()> {
+    pub fn end_fight(ctx: Context<EndFight>, final_hp: u32) -> Result<()> {
         let betting_round = &mut ctx.accounts.betting_round;
         let clock = Clock::get()?;
 
@@ -297,7 +297,10 @@ pub mod boss_fight_betting {
 
         // Fight can end either by time expiry or boss HP reaching 0
         let fight_expired = clock.unix_timestamp >= betting_round.fight_end_time;
-        let boss_dead = betting_round.current_hp == 0;
+        
+        betting_round.current_hp = final_hp;
+        let boss_dead = final_hp == 0;
+        betting_round.current_hp = final_hp;
 
         require!(fight_expired || boss_dead, BettingError::FightNotFinished);
 
@@ -306,7 +309,7 @@ pub mod boss_fight_betting {
 
         emit!(FightEnded {
             round_id: betting_round.round_id,
-            boss_defeated: boss_dead,
+            boss_defeated: boss_dead
         });
 
         Ok(())
@@ -314,102 +317,124 @@ pub mod boss_fight_betting {
 
     /// Claim payout for winning bet
     pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
-        let betting_round = &ctx.accounts.betting_round;
-        let bet_account = &mut ctx.accounts.bet_account;
-        let escrow_info = ctx.accounts.escrow.to_account_info();
+    let betting_round = &ctx.accounts.betting_round;
+    let bet_account = &mut ctx.accounts.bet_account;
+    let escrow_info = ctx.accounts.escrow.to_account_info();
 
-        require!(
-            betting_round.phase == GamePhase::Ended,
-            BettingError::FightNotEnded
-        );
-        require!(
-            !bet_account.payout_claimed,
-            BettingError::PayoutAlreadyClaimed
-        );
-        require!(
-            bet_account.bettor == ctx.accounts.bettor.key(),
-            BettingError::Unauthorized
-        );
+    // --- Pre-flight checks ---
 
-        // Check if bet won
-        let won = match bet_account.prediction {
-            BossPrediction::Death => betting_round.boss_defeated,
-            BossPrediction::Survival => !betting_round.boss_defeated,
-        };
+    require!(
+        betting_round.phase == GamePhase::Ended,
+        BettingError::FightNotEnded
+    );
+    require!(
+        !bet_account.payout_claimed,
+        BettingError::PayoutAlreadyClaimed
+    );
+    require!(
+        bet_account.bettor == ctx.accounts.bettor.key(),
+        BettingError::Unauthorized
+    );
 
-        require!(won, BettingError::BetLost);
+    // Check if bet won
+    let won = match bet_account.prediction {
+        BossPrediction::Death => betting_round.boss_defeated,
+        BossPrediction::Survival => !betting_round.boss_defeated,
+    };
 
-        // Calculate payout
-        let total_winning_bets = if betting_round.boss_defeated {
-            betting_round.total_death_bets
-        } else {
-            betting_round.total_survival_bets
-        };
+    // This is the correct check to prevent a non-winner from claiming
+    require!(won, BettingError::BetLost);
 
-        let total_losing_bets = if betting_round.boss_defeated {
-            betting_round.total_survival_bets
-        } else {
-            betting_round.total_death_bets
-        };
+    // --- Calculate total bets for winning and losing sides ---
 
-        let fee_amount = total_losing_bets
+    let total_winning_bets = if betting_round.boss_defeated {
+        betting_round.total_death_bets
+    } else {
+        betting_round.total_survival_bets
+    };
+
+    let total_losing_bets = if betting_round.boss_defeated {
+        betting_round.total_survival_bets
+    } else {
+        betting_round.total_death_bets
+    };
+
+    // --- FIX: Safely calculate Fee and Prize Pool (Handle Zero Loser Bets) ---
+    
+    let (fee_amount, prize_pool) = if total_losing_bets == 0 {
+        // If there are no losers, the prize pool and fee are both 0.
+        (0, 0)
+    } else {
+        // Standard calculation when there is a losing pool
+        let fee = total_losing_bets
             .checked_mul(betting_round.fee_percentage as u64)
             .unwrap()
             .checked_div(100)
             .unwrap();
 
-        let prize_pool = total_losing_bets.checked_sub(fee_amount).unwrap();
+        let pool = total_losing_bets.checked_sub(fee).unwrap();
+        (fee, pool)
+    };
 
-        // Calculate individual payout
-        let prize_share = if total_winning_bets > 0 {
-            prize_pool
-                .checked_mul(bet_account.amount)
-                .unwrap()
-                .checked_div(total_winning_bets)
-                .unwrap()
-        } else {
-            0
-        };
+    // --- Calculate individual payout ---
 
-        let total_payout = bet_account.amount.checked_add(prize_share).unwrap();
-        
-        // Ensure escrow has enough lamports to send the payout
-        require!(escrow_info.lamports() >= total_payout, BettingError::InsufficientEscrowFunds);
+    // prize_share will be 0 if prize_pool is 0. This is fine.
+    let prize_share = if total_winning_bets > 0 {
+        prize_pool
+            .checked_mul(bet_account.amount)
+            .unwrap()
+            .checked_div(total_winning_bets)
+            .unwrap()
+    } else {
+        // This should not happen if `won` is true, but is a safe default.
+        0
+    };
 
-        // Prepare the PDA seeds for signing
-        let round_id_bytes = betting_round.round_id.to_le_bytes();
-        let escrow_seeds: &[&[u8]] = &[
-            b"escrow",
-            round_id_bytes.as_ref(),
-            &[betting_round.escrow_bump],
-        ];
-        let signer_seeds = &[&escrow_seeds[..]];
+    // total_payout = original_stake + prize_share
+    // If prize_share is 0 (due to no losers), the user still gets their stake back.
+    let total_payout = bet_account.amount.checked_add(prize_share).unwrap();
+    
+    // Ensure escrow has enough lamports to send the payout
+    require!(escrow_info.lamports() >= total_payout, BettingError::InsufficientEscrowFunds);
 
-        // Execute the transfer, signed by the PDA
-        system_program::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.system_program.to_account_info(),
-                system_program::Transfer {
-                    from: escrow_info,
-                    to: ctx.accounts.bettor.to_account_info(),
-                },
-                signer_seeds
-            ),
-            total_payout,
-        )?;
+    // --- Transfer SOL back to bettor (signed by the PDA) ---
 
-        bet_account.payout_claimed = true;
+    // Prepare the PDA seeds for signing
+    let round_id_bytes = betting_round.round_id.to_le_bytes();
+    let escrow_seeds: &[&[u8]] = &[
+        b"escrow",
+        round_id_bytes.as_ref(),
+        &[betting_round.escrow_bump],
+    ];
+    let signer_seeds = &[&escrow_seeds[..]];
 
-        emit!(PayoutClaimed {
-            round_id: betting_round.round_id,
-            bettor: ctx.accounts.bettor.key(),
-            original_bet: bet_account.amount,
-            prize_share,
-            total_payout,
-        });
-        
-        Ok(())
-    }
+    // Execute the transfer, signed by the PDA
+    system_program::transfer(
+        CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: escrow_info,
+                to: ctx.accounts.bettor.to_account_info(),
+            },
+            signer_seeds
+        ),
+        total_payout,
+    )?;
+
+    // --- Finalize and Emit ---
+
+    bet_account.payout_claimed = true;
+
+    emit!(PayoutClaimed {
+        round_id: betting_round.round_id,
+        bettor: ctx.accounts.bettor.key(),
+        original_bet: bet_account.amount,
+        prize_share,
+        total_payout,
+    });
+    
+    Ok(())
+}
 
     /// Claim fees (called by treasury)
     pub fn claim_fees(ctx: Context<ClaimFees>) -> Result<()> {

@@ -8,11 +8,15 @@ skip-lint = false
 [programs.devnet]
 boss_fight_betting = "FtQbMDA7w8a9icfbMkuTxxQ695Wp9e6RQFSGVjmYQgz3"
 
+[programs.testnet]
+boss_fight_betting = "FtQbMDA7w8a9icfbMkuTxxQ695Wp9e6RQFSGVjmYQgz3"
+
 [registry]
 url = "https://api.apr.dev"
 
+
 [provider]
-cluster = "devnet"
+cluster = "testnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
