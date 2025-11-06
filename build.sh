@@ -25,7 +25,7 @@ echo "✅ Prerequisites check passed"
 
 # Set Solana config for development
 echo "🌐 Setting up Solana config for devnet..."
-solana config set --url testnet
+solana config set --url devnet
 solana config set --keypair ~/.config/solana/id.json
 
 echo "📊 Current Solana configuration:"

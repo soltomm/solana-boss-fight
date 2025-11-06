@@ -282,7 +282,7 @@ pub mod boss_fight_betting {
     }
 
     /// End the fight and determine outcome
-    pub fn end_fight(ctx: Context<EndFight>, final_hp: u32) -> Result<()> {
+    pub fn end_fight(ctx: Context<EndFight>, final_hp: u64) -> Result<()> {
         let betting_round = &mut ctx.accounts.betting_round;
         let clock = Clock::get()?;
 
@@ -298,20 +298,16 @@ pub mod boss_fight_betting {
         // Fight can end either by time expiry or boss HP reaching 0
         let fight_expired = clock.unix_timestamp >= betting_round.fight_end_time;
         
-        betting_round.current_hp = final_hp;
+        betting_round.current_hp = final_hp as u32;
         let boss_dead = final_hp == 0;
-        betting_round.current_hp = final_hp;
 
+        // Line 302
         require!(fight_expired || boss_dead, BettingError::FightNotFinished);
 
         betting_round.phase = GamePhase::Ended;
         betting_round.boss_defeated = boss_dead;
 
-        emit!(FightEnded {
-            round_id: betting_round.round_id,
-            boss_defeated: boss_dead
-        });
-
+        // ... rest of the function
         Ok(())
     }
 
