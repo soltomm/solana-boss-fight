@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint};
+use anchor_spl::associated_token::AssociatedToken;
 
 declare_id!("FtQbMDA7w8a9icfbMkuTxxQ695Wp9e6RQFSGVjmYQgz3");
 
@@ -13,6 +14,7 @@ pub struct BettingRound {
     pub round_id: u64,
     pub authority: Pubkey,
     pub treasury: Pubkey,
+    pub token_mint: Pubkey,  // NEW: Token mint address
     pub betting_start_time: i64,
     pub betting_end_time: i64,
     pub fight_end_time: i64,
@@ -63,6 +65,7 @@ pub struct BettingRoundInitialized {
     pub round_id: u64,
     pub betting_end_time: i64,
     pub fight_end_time: i64,
+    pub token_mint: Pubkey,  // NEW
 }
 
 #[event]
@@ -130,9 +133,9 @@ pub mod boss_fight_betting {
         betting_round.round_id = round_id;
         betting_round.authority = ctx.accounts.authority.key();
         betting_round.treasury = ctx.accounts.treasury.key();
+        betting_round.token_mint = ctx.accounts.token_mint.key();  // NEW
         betting_round.betting_start_time = clock.unix_timestamp;
         
-        // FIXED: Use checked_add for arithmetic operations
         betting_round.betting_end_time = clock.unix_timestamp
             .checked_add(betting_duration)
             .ok_or(BettingError::ArithmeticOverflow)?;
@@ -152,12 +155,13 @@ pub mod boss_fight_betting {
         betting_round.total_bets_count = 0;
         betting_round.boss_defeated = false;
         betting_round.payouts_processed = false;
-        betting_round.escrow_bump = ctx.bumps.escrow;
+        betting_round.escrow_bump = ctx.bumps.escrow_token_account;
 
         emit!(BettingRoundInitialized {
             round_id,
             betting_end_time: betting_round.betting_end_time,
             fight_end_time: betting_round.fight_end_time,
+            token_mint: betting_round.token_mint,
         });
 
         Ok(())
@@ -174,6 +178,12 @@ pub mod boss_fight_betting {
         let bet_account = &mut ctx.accounts.bet_account;
         let clock = Clock::get()?;
 
+        // Explicit signer check (bettor must sign the transaction)
+        require!(
+            ctx.accounts.bettor.is_signer,
+            BettingError::Unauthorized
+        );
+
         // Validate betting phase and timing
         require!(
             betting_round.phase == GamePhase::Betting,
@@ -183,16 +193,17 @@ pub mod boss_fight_betting {
             clock.unix_timestamp <= betting_round.betting_end_time,
             BettingError::BettingPeriodExpired
         );
-        require!(amount >= 100_000_000, BettingError::BetTooSmall); // Minimum 0.1 SOL
+        require!(amount >= 100_000, BettingError::BetTooSmall); // Adjust minimum based on token decimals
         require!(username.len() <= 32, BettingError::UsernameTooLong);
 
-        // Transfer SOL to escrow
-        system_program::transfer(
+        // Transfer tokens to escrow (NEW: SPL Token transfer instead of SOL)
+        token::transfer(
             CpiContext::new(
-                ctx.accounts.system_program.to_account_info(),
-                system_program::Transfer {
-                    from: ctx.accounts.bettor.to_account_info(),
-                    to: ctx.accounts.escrow.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.bettor_token_account.to_account_info(),
+                    to: ctx.accounts.escrow_token_account.to_account_info(),
+                    authority: ctx.accounts.bettor.to_account_info(),
                 },
             ),
             amount,
@@ -295,147 +306,130 @@ pub mod boss_fight_betting {
             BettingError::Unauthorized
         );
 
-        // Fight can end either by time expiry or boss HP reaching 0
         let fight_expired = clock.unix_timestamp >= betting_round.fight_end_time;
         
         betting_round.current_hp = final_hp as u32;
         let boss_dead = final_hp == 0;
 
-        // Line 302
         require!(fight_expired || boss_dead, BettingError::FightNotFinished);
 
         betting_round.phase = GamePhase::Ended;
         betting_round.boss_defeated = boss_dead;
 
-        // ... rest of the function
+        emit!(FightEnded {
+            round_id: betting_round.round_id,
+            boss_defeated: boss_dead,
+        });
+
         Ok(())
     }
 
     /// Claim payout for winning bet
     pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
-    let betting_round = &ctx.accounts.betting_round;
-    let bet_account = &mut ctx.accounts.bet_account;
-    let escrow_info = ctx.accounts.escrow.to_account_info();
+        let betting_round = &ctx.accounts.betting_round;
+        let bet_account = &mut ctx.accounts.bet_account;
 
-    // --- Pre-flight checks ---
+        require!(
+            betting_round.phase == GamePhase::Ended,
+            BettingError::FightNotEnded
+        );
+        require!(
+            !bet_account.payout_claimed,
+            BettingError::PayoutAlreadyClaimed
+        );
+        require!(
+            bet_account.bettor == ctx.accounts.bettor.key(),
+            BettingError::Unauthorized
+        );
 
-    require!(
-        betting_round.phase == GamePhase::Ended,
-        BettingError::FightNotEnded
-    );
-    require!(
-        !bet_account.payout_claimed,
-        BettingError::PayoutAlreadyClaimed
-    );
-    require!(
-        bet_account.bettor == ctx.accounts.bettor.key(),
-        BettingError::Unauthorized
-    );
+        // Check if bet won
+        let won = match bet_account.prediction {
+            BossPrediction::Death => betting_round.boss_defeated,
+            BossPrediction::Survival => !betting_round.boss_defeated,
+        };
 
-    // Check if bet won
-    let won = match bet_account.prediction {
-        BossPrediction::Death => betting_round.boss_defeated,
-        BossPrediction::Survival => !betting_round.boss_defeated,
-    };
+        require!(won, BettingError::BetLost);
 
-    // This is the correct check to prevent a non-winner from claiming
-    require!(won, BettingError::BetLost);
+        let total_winning_bets = if betting_round.boss_defeated {
+            betting_round.total_death_bets
+        } else {
+            betting_round.total_survival_bets
+        };
 
-    // --- Calculate total bets for winning and losing sides ---
+        let total_losing_bets = if betting_round.boss_defeated {
+            betting_round.total_survival_bets
+        } else {
+            betting_round.total_death_bets
+        };
 
-    let total_winning_bets = if betting_round.boss_defeated {
-        betting_round.total_death_bets
-    } else {
-        betting_round.total_survival_bets
-    };
+        let (fee_amount, prize_pool) = if total_losing_bets == 0 {
+            (0, 0)
+        } else {
+            let fee = total_losing_bets
+                .checked_mul(betting_round.fee_percentage as u64)
+                .unwrap()
+                .checked_div(100)
+                .unwrap();
 
-    let total_losing_bets = if betting_round.boss_defeated {
-        betting_round.total_survival_bets
-    } else {
-        betting_round.total_death_bets
-    };
+            let pool = total_losing_bets.checked_sub(fee).unwrap();
+            (fee, pool)
+        };
 
-    // --- FIX: Safely calculate Fee and Prize Pool (Handle Zero Loser Bets) ---
-    
-    let (fee_amount, prize_pool) = if total_losing_bets == 0 {
-        // If there are no losers, the prize pool and fee are both 0.
-        (0, 0)
-    } else {
-        // Standard calculation when there is a losing pool
-        let fee = total_losing_bets
-            .checked_mul(betting_round.fee_percentage as u64)
-            .unwrap()
-            .checked_div(100)
-            .unwrap();
+        let prize_share = if total_winning_bets > 0 {
+            prize_pool
+                .checked_mul(bet_account.amount)
+                .unwrap()
+                .checked_div(total_winning_bets)
+                .unwrap()
+        } else {
+            0
+        };
 
-        let pool = total_losing_bets.checked_sub(fee).unwrap();
-        (fee, pool)
-    };
+        let total_payout = bet_account.amount.checked_add(prize_share).unwrap();
+        
+        require!(
+            ctx.accounts.escrow_token_account.amount >= total_payout,
+            BettingError::InsufficientEscrowFunds
+        );
 
-    // --- Calculate individual payout ---
+        // NEW: Transfer tokens back to bettor (signed by the PDA)
+        let round_id_bytes = betting_round.round_id.to_le_bytes();
+        let escrow_seeds: &[&[u8]] = &[
+            b"escrow",
+            round_id_bytes.as_ref(),
+            &[betting_round.escrow_bump],
+        ];
+        let signer_seeds = &[&escrow_seeds[..]];
 
-    // prize_share will be 0 if prize_pool is 0. This is fine.
-    let prize_share = if total_winning_bets > 0 {
-        prize_pool
-            .checked_mul(bet_account.amount)
-            .unwrap()
-            .checked_div(total_winning_bets)
-            .unwrap()
-    } else {
-        // This should not happen if `won` is true, but is a safe default.
-        0
-    };
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.escrow_token_account.to_account_info(),
+                    to: ctx.accounts.bettor_token_account.to_account_info(),
+                    authority: ctx.accounts.escrow_token_account.to_account_info(),
+                },
+                signer_seeds
+            ),
+            total_payout,
+        )?;
 
-    // total_payout = original_stake + prize_share
-    // If prize_share is 0 (due to no losers), the user still gets their stake back.
-    let total_payout = bet_account.amount.checked_add(prize_share).unwrap();
-    
-    // Ensure escrow has enough lamports to send the payout
-    require!(escrow_info.lamports() >= total_payout, BettingError::InsufficientEscrowFunds);
+        bet_account.payout_claimed = true;
 
-    // --- Transfer SOL back to bettor (signed by the PDA) ---
-
-    // Prepare the PDA seeds for signing
-    let round_id_bytes = betting_round.round_id.to_le_bytes();
-    let escrow_seeds: &[&[u8]] = &[
-        b"escrow",
-        round_id_bytes.as_ref(),
-        &[betting_round.escrow_bump],
-    ];
-    let signer_seeds = &[&escrow_seeds[..]];
-
-    // Execute the transfer, signed by the PDA
-    system_program::transfer(
-        CpiContext::new_with_signer(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: escrow_info,
-                to: ctx.accounts.bettor.to_account_info(),
-            },
-            signer_seeds
-        ),
-        total_payout,
-    )?;
-
-    // --- Finalize and Emit ---
-
-    bet_account.payout_claimed = true;
-
-    emit!(PayoutClaimed {
-        round_id: betting_round.round_id,
-        bettor: ctx.accounts.bettor.key(),
-        original_bet: bet_account.amount,
-        prize_share,
-        total_payout,
-    });
-    
-    Ok(())
-}
+        emit!(PayoutClaimed {
+            round_id: betting_round.round_id,
+            bettor: ctx.accounts.bettor.key(),
+            original_bet: bet_account.amount,
+            prize_share,
+            total_payout,
+        });
+        
+        Ok(())
+    }
 
     /// Claim fees (called by treasury)
     pub fn claim_fees(ctx: Context<ClaimFees>) -> Result<()> {
         let betting_round = &ctx.accounts.betting_round;
-        let escrow_info = ctx.accounts.escrow.to_account_info();
 
         require!(
             betting_round.phase == GamePhase::Ended,
@@ -458,10 +452,12 @@ pub mod boss_fight_betting {
             .checked_div(100)
             .unwrap();
 
-        // Ensure escrow has enough lamports to send the fees
-        require!(escrow_info.lamports() >= fee_amount, BettingError::InsufficientEscrowFunds);
+        require!(
+            ctx.accounts.escrow_token_account.amount >= fee_amount,
+            BettingError::InsufficientEscrowFunds
+        );
 
-        // Prepare the PDA seeds for signing
+        // NEW: Transfer tokens to treasury (signed by the PDA)
         let round_id_bytes = betting_round.round_id.to_le_bytes();
         let escrow_seeds: &[&[u8]] = &[
             b"escrow",
@@ -470,13 +466,13 @@ pub mod boss_fight_betting {
         ];
         let signer_seeds = &[&escrow_seeds[..]];
 
-        // Execute the transfer, signed by the PDA
-        system_program::transfer(
+        token::transfer(
             CpiContext::new_with_signer(
-                ctx.accounts.system_program.to_account_info(),
-                system_program::Transfer {
-                    from: escrow_info,
-                    to: ctx.accounts.treasury.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.escrow_token_account.to_account_info(),
+                    to: ctx.accounts.treasury_token_account.to_account_info(),
+                    authority: ctx.accounts.escrow_token_account.to_account_info(),
                 },
                 signer_seeds
             ),
@@ -494,7 +490,7 @@ pub mod boss_fight_betting {
 }
 
 // =================================================================
-// ⭐️ ACCOUNTS CONTEXTS (UPDATED FOR BUMPS & WRITABILITY) ⭐️
+// ⭐️ ACCOUNTS CONTEXTS (UPDATED FOR TOKEN ACCOUNTS) ⭐️
 // =================================================================
 
 #[derive(Accounts)]
@@ -509,20 +505,36 @@ pub struct InitializeBettingRound<'info> {
     )]
     pub betting_round: Account<'info, BettingRound>,
 
+    // NEW: Token escrow account (PDA-owned token account)
     #[account(
-        mut,
+        init,
+        payer = authority,
+        token::mint = token_mint,
+        token::authority = escrow_token_account,
         seeds = [b"escrow", round_id.to_le_bytes().as_ref()],
         bump
     )]
-    pub escrow: SystemAccount<'info>,
+    pub escrow_token_account: Account<'info, TokenAccount>,
 
-    #[account(mut)]
+    // NEW: Token mint account (your pump.fun token)
+    pub token_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = authority.key() != treasury.key() @ BettingError::InvalidAccount,
+        constraint = authority.key() != token_mint.key() @ BettingError::InvalidAccount
+    )]
     pub authority: Signer<'info>,
 
-    /// CHECK: Treasury account for fee collection
+    /// CHECK: Treasury account for fee collection - validated to not be authority
+    #[account(
+        constraint = treasury.key() != token_mint.key() @ BettingError::InvalidAccount
+    )]
     pub treasury: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,  // NEW
+    pub rent: Sysvar<'info, Rent>,  // NEW
 }
 
 #[derive(Accounts)]
@@ -543,19 +555,30 @@ pub struct PlaceBet<'info> {
     )]
     pub bet_account: Account<'info, BetAccount>,
 
+    // NEW: Escrow token account
     #[account(
         mut,
         seeds = [b"escrow", betting_round.round_id.to_le_bytes().as_ref()],
         bump,
-        constraint = escrow.key() != bettor.key() @ BettingError::InvalidAccount
+        constraint = escrow_token_account.mint == betting_round.token_mint @ BettingError::InvalidTokenMint,
+        constraint = escrow_token_account.key() != bettor_token_account.key() @ BettingError::InvalidAccount
     )]
-    /// CHECK: This is safe because it's the escrow account
-    pub escrow: UncheckedAccount<'info>,
+    pub escrow_token_account: Account<'info, TokenAccount>,
+
+    // NEW: Bettor's token account
+    #[account(
+        mut,
+        constraint = bettor_token_account.owner == bettor.key() @ BettingError::InvalidTokenAccount,
+        constraint = bettor_token_account.mint == betting_round.token_mint @ BettingError::InvalidTokenMint,
+        constraint = bettor_token_account.key() != escrow_token_account.key() @ BettingError::InvalidAccount
+    )]
+    pub bettor_token_account: Account<'info, TokenAccount>,
 
     #[account(mut)]
     pub bettor: Signer<'info>,
 
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,  // NEW
 }
 
 #[derive(Accounts)]
@@ -593,13 +616,24 @@ pub struct ClaimPayout<'info> {
     )]
     pub bet_account: Account<'info, BetAccount>,
 
+    // NEW: Escrow token account
     #[account(
         mut,
         seeds = [b"escrow", betting_round.round_id.to_le_bytes().as_ref()],
-        bump
+        bump,
+        constraint = escrow_token_account.mint == betting_round.token_mint @ BettingError::InvalidTokenMint,
+        constraint = escrow_token_account.key() != bettor_token_account.key() @ BettingError::InvalidAccount
     )]
-    /// CHECK: This is safe because it's the escrow account
-    pub escrow: UncheckedAccount<'info>,
+    pub escrow_token_account: Account<'info, TokenAccount>,
+
+    // NEW: Bettor's token account
+    #[account(
+        mut,
+        constraint = bettor_token_account.owner == bettor.key() @ BettingError::InvalidTokenAccount,
+        constraint = bettor_token_account.mint == betting_round.token_mint @ BettingError::InvalidTokenMint,
+        constraint = bettor_token_account.key() != escrow_token_account.key() @ BettingError::InvalidAccount
+    )]
+    pub bettor_token_account: Account<'info, TokenAccount>,
 
     #[account(mut)]
     pub bettor: SystemAccount<'info>,
@@ -610,27 +644,44 @@ pub struct ClaimPayout<'info> {
     pub authority: Signer<'info>, 
 
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,  // NEW
 }
 
 #[derive(Accounts)]
 pub struct ClaimFees<'info> {
     pub betting_round: Account<'info, BettingRound>,
 
+    // NEW: Escrow token account
     #[account(
         mut,
         seeds = [b"escrow", betting_round.round_id.to_le_bytes().as_ref()],
-        bump
+        bump,
+        constraint = escrow_token_account.mint == betting_round.token_mint @ BettingError::InvalidTokenMint,
+        constraint = escrow_token_account.key() != treasury_token_account.key() @ BettingError::InvalidAccount
     )]
-    /// CHECK: This is safe because it's the escrow account
-    pub escrow: UncheckedAccount<'info>,
+    pub escrow_token_account: Account<'info, TokenAccount>,
 
-    #[account(mut)]
-    /// CHECK: Treasury account for fee collection
+    // NEW: Treasury token account
+    #[account(
+        mut,
+        constraint = treasury_token_account.mint == betting_round.token_mint @ BettingError::InvalidTokenMint,
+        constraint = treasury_token_account.key() != escrow_token_account.key() @ BettingError::InvalidAccount
+    )]
+    pub treasury_token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: Treasury account for fee collection - validated against betting_round.treasury
+    #[account(
+        constraint = treasury.key() == betting_round.treasury @ BettingError::Unauthorized
+    )]
     pub treasury: UncheckedAccount<'info>,
 
+    #[account(
+        constraint = authority.key() != treasury.key() @ BettingError::InvalidAccount
+    )]
     pub authority: Signer<'info>, 
 
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,  // NEW
 }
 
 // =================================================================
@@ -669,4 +720,8 @@ pub enum BettingError {
     InvalidAccount,
     #[msg("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[msg("Invalid token mint")]
+    InvalidTokenMint,  // NEW
+    #[msg("Invalid token account")]
+    InvalidTokenAccount,  // NEW
 }
