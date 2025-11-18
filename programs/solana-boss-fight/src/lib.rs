@@ -363,29 +363,36 @@ pub mod boss_fight_betting {
         };
 
         let (fee_amount, prize_pool) = if total_losing_bets == 0 {
-            (0, 0)
-        } else {
-            let fee = total_losing_bets
-                .checked_mul(betting_round.fee_percentage as u64)
-                .unwrap()
-                .checked_div(100)
-                .unwrap();
+    (0, 0)
+} else {
+    let fee = (total_losing_bets as u128)
+        .checked_mul(betting_round.fee_percentage as u128)
+        .ok_or(BettingError::ArithmeticOverflow)?
+        .checked_div(100)
+        .ok_or(BettingError::ArithmeticOverflow)?;
+    
+    let fee_u64 = u64::try_from(fee).map_err(|_| BettingError::ArithmeticOverflow)?;
+    let pool = total_losing_bets
+        .checked_sub(fee_u64)
+        .ok_or(BettingError::ArithmeticOverflow)?;
+    (fee_u64, pool)
+};
 
-            let pool = total_losing_bets.checked_sub(fee).unwrap();
-            (fee, pool)
-        };
+let prize_share = if total_winning_bets > 0 {
+    let share = (prize_pool as u128)
+        .checked_mul(bet_account.amount as u128)
+        .ok_or(BettingError::ArithmeticOverflow)?
+        .checked_div(total_winning_bets as u128)
+        .ok_or(BettingError::ArithmeticOverflow)?;
+    
+    u64::try_from(share).map_err(|_| BettingError::ArithmeticOverflow)?
+} else {
+    0
+};
 
-        let prize_share = if total_winning_bets > 0 {
-            prize_pool
-                .checked_mul(bet_account.amount)
-                .unwrap()
-                .checked_div(total_winning_bets)
-                .unwrap()
-        } else {
-            0
-        };
-
-        let total_payout = bet_account.amount.checked_add(prize_share).unwrap();
+let total_payout = bet_account.amount
+    .checked_add(prize_share)
+    .ok_or(BettingError::ArithmeticOverflow)?;
         
         require!(
             ctx.accounts.escrow_token_account.amount >= total_payout,
